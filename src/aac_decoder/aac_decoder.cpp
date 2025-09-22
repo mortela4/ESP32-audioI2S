@@ -1641,6 +1641,8 @@ static const uint32_t invQuant4[16] PROGMEM = {
 static const int8_t sgnMask[3] = {0x02,  0x04,  0x08};
 static const int8_t negMask[3] = {~0x03, ~0x07, ~0x0f};
 
+
+#if defined(USE_AAC_AUDIOBUF_DYNAMIC_ALLOC) && (USE_AAC_AUDIOBUF_DYNAMIC_ALLOC == 1)
 /***********************************************************************************************************************
  * Function:    AACDecoder_AllocateBuffers
  *
@@ -1716,6 +1718,101 @@ bool AACDecoder_AllocateBuffers(void){
 
     return true;
 }
+#else    // Use STATIC allocation of buffers on HEAP!
+// NOTE: horrible hack - preallocating EVERYTHING needed for AAC-decoding!
+// I.e. code based on ASSUMPTIONS!! (we KNOW that we only need AAC, basically ...)
+static uint8_t PSinfoBuf[sizeof(PSInfoSBR_t)];
+static uint8_t AACDecinfoBuf[sizeof(AACDecInfo_t)];
+static uint8_t PSinfoBaseBuf[sizeof(PSInfoBase_t)];
+static uint8_t ProgCfgElemBuf[sizeof(ProgConfigElement_t)*16];
+
+
+/***********************************************************************************************************************
+ * Function:    AACDecoder_AllocateBuffers
+ *
+ * Description: allocate all the memory needed for the AAC decoder
+ *              try heap first, because it's faster
+ *
+ * Inputs:      none
+ *
+ * Outputs:     none
+ *
+ * Return:      false if not enough memory, otherwise true
+ *
+ **********************************************************************************************************************/
+
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    // ESP32-S3: If there is PSRAM, prefer it
+    #define __malloc_heap_psram(size) \
+        heap_caps_malloc_prefer(size, 2, MALLOC_CAP_DEFAULT|MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL)
+#else
+    // ESP32, PSRAM is too slow, prefer SRAM
+    #define __malloc_heap_psram(size) \
+        heap_caps_malloc_prefer(size, 2, MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL, MALLOC_CAP_DEFAULT|MALLOC_CAP_SPIRAM)
+#endif
+
+bool AACDecoder_AllocateBuffers(void){
+
+    /* here, sizes are: AACDecInfo_t:96 PSInfoBase_t:27364 ProgConfigElement_t*16:1312 PSInfoSBR_t:50788 */
+#ifdef AAC_ENABLE_SBR
+    if(!m_PSInfoSBR) 
+    {
+        //m_PSInfoSBR   = (PSInfoSBR_t*)__malloc_heap_psram(sizeof(PSInfoSBR_t));
+        m_PSInfoSBR = (PSInfoSBR_t*)PSinfoBuf;
+
+    }
+
+    if(!m_PSInfoSBR) {
+        log_e("OOM in SBR, can't allocate %d bytes\n", sizeof(PSInfoSBR_t));
+        return false; // ERR_AAC_SBR_INIT;
+    }
+    else {
+        log_d("AAC Spectral Band Replication enabled, %d additional bytes allocated", sizeof(PSInfoSBR_t));
+    }
+#endif
+
+    /* these could fall back to PSRAM if not enough heap available */
+    // if(!m_AACDecInfo) {m_AACDecInfo = (AACDecInfo_t*)        __malloc_heap_psram(sizeof(AACDecInfo_t));}
+    // if(!m_PSInfoBase) {m_PSInfoBase = (PSInfoBase_t*)        __malloc_heap_psram(sizeof(PSInfoBase_t));}
+    // if(!m_pce[0])     {m_pce[0]     = (ProgConfigElement_t*) __malloc_heap_psram(sizeof(ProgConfigElement_t)*16);}
+    if(!m_AACDecInfo) {m_AACDecInfo = (AACDecInfo_t*)AACDecinfoBuf;}
+    if(!m_PSInfoBase) {m_PSInfoBase = (PSInfoBase_t*)PSinfoBaseBuf;}
+    if(!m_pce[0])     {m_pce[0]     = (ProgConfigElement_t*)ProgCfgElemBuf;}
+
+    // After hack - this check is pointless ...
+    // if(!m_AACDecInfo || !m_PSInfoBase || !m_pce[0]) {
+    //         log_e("not enough memory to allocate aacdecoder buffers");
+    //         AACDecoder_FreeBuffers();
+    //         return false;
+    // }
+
+    // Clear Buffers:
+    memset( m_AACDecInfo,        0, sizeof(AACDecInfo_t));              //Clear AACDecInfo
+    memset( m_PSInfoBase,        0, sizeof(PSInfoBase_t));              //Clear PSInfoBase
+    memset(&m_AACFrameInfo,      0, sizeof(AACFrameInfo_t));            //Clear AACFrameInfo
+    memset(&m_fhADTS,            0, sizeof(ADTSHeader_t));              //Clear fhADTS
+    memset(&m_fhADIF,            0, sizeof(ADIFHeader_t));              //Clear fhADIS
+    memset( m_pce[0],            0, sizeof(ProgConfigElement_t) * 16);  //Clear ProgConfigElement
+    memset(&m_pulseInfo[0],      0, sizeof(PulseInfo_t) *2);            //Clear PulseInfo
+    memset(&m_aac_BitStreamInfo, 0, sizeof(aac_BitStreamInfo_t));       //Clear aac_BitStreamInfo
+#ifdef AAC_ENABLE_SBR
+    memset( m_PSInfoSBR,         0, sizeof(PSInfoSBR_t));               //Clear PSInfoSBR
+    InitSBRState();
+#endif
+
+    m_AACDecInfo->prevBlockID = AAC_ID_INVALID;
+    m_AACDecInfo->currBlockID = AAC_ID_INVALID;
+    m_AACDecInfo->currInstTag = -1;
+    for(int ch = 0; ch < MAX_NCHANS_ELEM; ch++)
+        m_AACDecInfo->sbDeinterleaveReqd[ch] = 0;
+    m_AACDecInfo->adtsBlocksLeft = 0;
+    m_AACDecInfo->tnsUsed = 0;
+    m_AACDecInfo->pnsUsed = 0;
+
+    return true;
+}
+#endif
+
 
 /**************************************************************************************
  * Function:    AACFlushCodec
@@ -1754,10 +1851,12 @@ int AACFlushCodec()
 
     return ERR_AAC_NONE;
 }
+
+
 /***********************************************************************************************************************
  * Function:    AACDecoder_FreeBuffers
  *
- * Description: allocate all the memory needed for the AAC decoder
+ * Description: De-allocate (i.e. 'free') all the memory used for the AAC decoder.
  *
  * Inputs:      none
  *
@@ -1767,7 +1866,8 @@ int AACFlushCodec()
 
  **********************************************************************************************************************/
 void AACDecoder_FreeBuffers(void) {
-
+// NOTE: w. 'horrible hack' - free'ing heap-allocated RAM is no longer relevant!!
+#if defined(USE_AAC_AUDIOBUF_DYNAMIC_ALLOC) && (USE_AAC_AUDIOBUF_DYNAMIC_ALLOC == 1)
 //    uint32_t i = ESP.getFreeHeap();
 
     if(m_AACDecInfo)                         {free(m_AACDecInfo);    m_AACDecInfo=NULL;}
@@ -1779,7 +1879,9 @@ void AACDecoder_FreeBuffers(void) {
 #endif
 
 //    log_i("AACDecoder: %lu bytes memory was freed", ESP.getFreeHeap() - i);
+#endif
 }
+
 
 /***********************************************************************************************************************
  * Function:    AACDecoder_IsInit
